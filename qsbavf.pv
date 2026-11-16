@@ -1,0 +1,334 @@
+(* ==================================================================
+   QS-BAVF -- ProVerif model (Chapter 5)
+   Algorithms 1, 2a, 2b, 3, 4, 5a, and an abstraction of 5b and 6.
+
+    SCOPE (symbolic model):
+   - Lattice signatures, ML-KEM-512, KDF, AEAD, H1--H4 and the fuzzy
+     extractor are ideal symbolic primitives. ProVerif checks the
+     protocol logic, NOT the mathematical security of SIS, Module-LWE
+     or a real ML-KEM-512 implementation (see the ROR proof, Ch. 5.4).
+   - Time is abstracted by epochs: a timestamp is stamp(epoch, t) and
+     an RSU accepts only timestamps of its current epoch.
+   - Batch verification (5b) is abstracted for a batch of two
+     messages: the batch is accepted iff every message verifies. The
+     random batchCoeff_i and the soundness error of the aggregate
+     equation are outside the symbolic model.
+   - Failure recovery (6) for a batch of two splits it into two
+     single messages and verifies each one with Algorithm 5a.
+   ================================================================== *)
+
+(* ---------------- Channels ---------------- *)
+free c     : channel.            (* public wireless channel          *)
+free c_op  : channel [private].  (* trusted operator, Alg. 2a        *)
+free c_tkt : channel [private].  (* ticket returned via the operator *)
+free c_clk : channel [private].  (* trusted clock (e.g. GNSS time)   *)
+
+(* ---------------- Types ---------------- *)
+type id.       (* real identity RID_Vi          *)
+type skey.     (* lattice private key            *)
+type pkey.     (* lattice public key pk = A.sk   *)
+type kskey.    (* ML-KEM-512 decapsulation key   *)
+type kpkey.    (* ML-KEM-512 encapsulation key   *)
+type key.      (* symmetric key K_reg            *)
+
+(* ---------------- Lattice key pair: pk = A . sk ---------------- *)
+fun pk(skey): pkey.
+
+(* ---- Lattice signature (commit, resp): ticket, pop, token ----
+   The signature does not reveal the signed hash value.          *)
+fun sign(bitstring, skey): bitstring.
+fun verify(bitstring, bitstring, pkey): bool
+reduc forall h: bitstring, k: skey;
+      verify(sign(h, k), h, pk(k)) = true.
+
+(* ---- Message signature of Alg. 4 ----
+   resp_sig = rand_sig + resp_tok + sk_V . msgHash combines the
+   vehicle key with an issuer token. Alg. 5a accepts iff
+   A.resp_sig = commit_sig + pk_issuer.tokenHash + pk_V.msgHash *)
+fun msign(bitstring, skey, bitstring): bitstring.
+fun mverify(bitstring, bitstring, bitstring, pkey, pkey): bool
+reduc forall mh: bitstring, th: bitstring, kv: skey, ki: skey;
+      mverify(msign(mh, kv, sign(th, ki)), mh, th, pk(kv), pk(ki))
+        = true.
+
+(* ---------------- ML-KEM-512 ---------------- *)
+fun ek(kskey): kpkey.
+fun kem_enc(bitstring, kpkey): bitstring.
+reduc forall ss: bitstring, dk: kskey;
+      kem_dec(kem_enc(ss, ek(dk)), dk) = ss.
+
+(* ---------------- KDF and AEAD ---------------- *)
+fun kdf(bitstring): key.
+fun aead_enc(key, bitstring): bitstring.
+reduc forall k: key, m: bitstring; aead_dec(k, aead_enc(k, m)) = m.
+
+(* ---------------- Hash functions H1--H4 (one-way) ---------------- *)
+fun H1(id, pkey, bitstring): bitstring.          (* ticketHash *)
+fun H2(bitstring, bitstring): bitstring.         (* popHash    *)
+fun H3(bitstring, pkey): bitstring.              (* tokenHash  *)
+fun H4(bitstring, bitstring, pkey, bitstring, bitstring): bitstring.
+                                                 (* msgHash    *)
+
+(* ---- Fuzzy extractor and pseudo-identity ----
+   Only the vehicle can evaluate Fuzzy(). pseudoID_i =
+   RID_Vi XOR Fuzzy(fzChallenge_i) is a one-way combination. *)
+fun Fuzzy(bitstring): bitstring [private].
+fun mkPseudoID(id, bitstring): bitstring.
+
+(* ---- Timestamp freshness abstraction ----
+   timestamp_j = stamp(epoch, t); an RSU accepts it only if its
+   epoch equals the RSU's current epoch.                        *)
+fun stamp(bitstring, bitstring): bitstring [data].
+
+(* ---------------- Secrecy targets ---------------- *)
+free RID_Vi    : id        [private].  (* real identity          *)
+free kreg_probe: bitstring [private].  (* encrypted under K_reg  *)
+
+(* ---------------- Events ---------------- *)
+event OperatorApproved(id, pkey).
+event TicketIssued(id, pkey, bitstring).
+event RegistrationAccepted(id, bitstring, pkey, bitstring).
+event BeginSign(bitstring, pkey, bitstring, bitstring, bitstring).
+event EndVerify(bitstring, pkey, bitstring, bitstring, bitstring).
+event StaleRejected(bitstring, bitstring).
+event ReplayAttempt(bitstring, bitstring).
+event ReplayRejected(bitstring, pkey, bitstring, bitstring,
+                     bitstring, bitstring).
+event BatchAccepted(bitstring, pkey, bitstring, bitstring,
+                    bitstring, pkey, bitstring, bitstring, bitstring).
+event BatchFailed(bitstring).
+event RecoveredValid(bitstring, pkey, bitstring, bitstring,
+                     bitstring).
+event InvalidIsolated(bitstring, bitstring).
+
+(* ---------------- Queries ---------------- *)
+(* Q1  identity confidentiality *)
+query attacker(RID_Vi).
+
+(* Q2  every accepted registration was operator-approved *)
+query r: id, p: bitstring, v: pkey, t: bitstring;
+      event(RegistrationAccepted(r, p, v, t))
+        ==> event(OperatorApproved(r, v)).
+
+(* Q3  single-use ticket: each issued ticket is accepted at most
+       once, for the identity and key it was issued to          *)
+query r: id, p: bitstring, v: pkey, t: bitstring;
+      inj-event(RegistrationAccepted(r, p, v, t))
+        ==> inj-event(TicketIssued(r, v, t)).
+
+(* Q4  secrecy of the ML-KEM-512-derived registration key *)
+query attacker(kreg_probe).
+
+(* Q5  injective message authentication, single verification *)
+query p: bitstring, v: pkey, m: bitstring, s: bitstring,
+      h: bitstring;
+      inj-event(EndVerify(p, v, m, s, h))
+        ==> inj-event(BeginSign(p, v, m, s, h)).
+
+(* Q6  a rejected replay is a genuine message of a registered
+       vehicle, signed under an older challenge                 *)
+query p: bitstring, v: pkey, m: bitstring, s: bitstring,
+      o: bitstring, n: bitstring, r: id, t: bitstring;
+      event(ReplayRejected(p, v, m, s, o, n))
+        ==> event(BeginSign(p, v, m, s, o))
+            && event(RegistrationAccepted(r, p, v, t)).
+
+(* Q7  injective message authentication, batch verification:
+       an accepted batch contains only genuine messages, each
+       signed under this RSU's challenge                         *)
+query p1: bitstring, v1: pkey, m1: bitstring, s1: bitstring,
+      p2: bitstring, v2: pkey, m2: bitstring, s2: bitstring,
+      h: bitstring;
+      inj-event(BatchAccepted(p1, v1, m1, s1, p2, v2, m2, s2, h))
+        ==> inj-event(BeginSign(p1, v1, m1, s1, h))
+            && inj-event(BeginSign(p2, v2, m2, s2, h)).
+
+(* Q8  injective message authentication, failure recovery *)
+query p: bitstring, v: pkey, m: bitstring, s: bitstring,
+      h: bitstring;
+      inj-event(RecoveredValid(p, v, m, s, h))
+        ==> inj-event(BeginSign(p, v, m, s, h)).
+
+(* ============================ Clock ============================ *)
+let ClockProcess =
+  ! new epoch: bitstring;
+    out(c, epoch);                         (* time is public *)
+    ! out(c_clk, epoch).
+
+(* ======================= Central Authority ======================= *)
+(* One CA session per approved vehicle. The session that issues a
+   ticket (Alg. 2a) is the only one that can accept it (Alg. 2b),
+   and it does so at most once: the ticket is single-use.         *)
+let CAProcess(skCA: skey, dkTA: kskey) =
+  ! in(c_op, (rid: id, vpk: pkey));
+    event OperatorApproved(rid, vpk);
+    (* ---- Algorithm 2a: ticket issuance ---- *)
+    new ticket_id: bitstring;
+    let tSig = sign(H1(rid, vpk, ticket_id), skCA) in
+    event TicketIssued(rid, vpk, ticket_id);
+    out(c_tkt, (vpk, (tSig, ticket_id, ek(dkTA))));
+    (* ---- Algorithm 2b: key exchange and enrolment ---- *)
+    in(c, ct: bitstring);
+    let ss = kem_dec(ct, dkTA) in
+    let Kreg = kdf(ss) in
+    in(c, encMsg: bitstring);
+    let ((tSigR: bitstring, =ticket_id, ekx: kpkey),
+         pseudoID: bitstring, =vpk, nonce: bitstring,
+         pop: bitstring) = aead_dec(Kreg, encMsg) in
+    (* both checks must pass before anything is accepted *)
+    if verify(tSigR, H1(rid, vpk, ticket_id), pk(skCA)) = true
+       && verify(pop, H2(ticket_id, nonce), vpk) = true then
+    (
+      event RegistrationAccepted(rid, pseudoID, vpk, ticket_id);
+      (* ---- Algorithm 3: registration token ---- *)
+      let token = sign(H3(pseudoID, vpk), skCA) in
+      out(c, (pseudoID, vpk, token))
+    )
+    else 0.
+
+(* ========================= Vehicle (OBU) ========================= *)
+let VehicleProcess(rid: id, pkCA: pkey, ekTA: kpkey) =
+  new skV: skey;
+  let vpk = pk(skV) in
+  (* Algorithm 2a: in person, through the trusted operator *)
+  out(c_op, (rid, vpk));
+  in(c_tkt, (=vpk, (tSig: bitstring, ticket_id: bitstring,
+                    ekx: kpkey)));
+  (* Algorithm 2b: ML-KEM-512 encapsulation and KDF *)
+  new ss: bitstring;
+  let Kreg = kdf(ss) in
+  out(c, kem_enc(ss, ekTA));
+  new fzChallenge: bitstring;
+  let pseudoID = mkPseudoID(rid, Fuzzy(fzChallenge)) in
+  new nonce: bitstring;                     (* fresh, single-use *)
+  let pop = sign(H2(ticket_id, nonce), skV) in
+  out(c, aead_enc(Kreg, ((tSig, ticket_id, ekx), pseudoID, vpk,
+                         nonce, pop)));
+  out(c, aead_enc(Kreg, kreg_probe));       (* probe for Q4 *)
+  (* Algorithm 3: receive and check the registration token *)
+  in(c, (=pseudoID, =vpk, token: bitstring));
+  if verify(token, H3(pseudoID, vpk), pkCA) = true then
+  (* Algorithm 4: sign every outgoing message *)
+  ! in(c, challenge_j: bitstring);
+    in(c_clk, epoch: bitstring);
+    new t: bitstring;
+    let timestamp_j = stamp(epoch, t) in
+    new m: bitstring;
+    let msgHash = H4(m, pseudoID, vpk, timestamp_j, challenge_j) in
+    event BeginSign(pseudoID, vpk, m, timestamp_j, challenge_j);
+    out(c, (m, pseudoID, vpk, timestamp_j, challenge_j,
+            msign(msgHash, skV, token))).
+
+(* ===================== RSU 1: Algorithm 5a ===================== *)
+let RSU1Process(pkCA: pkey) =
+  new challenge_j: bitstring;
+  out(c, challenge_j);
+  in(c_clk, epochR: bitstring);
+  in(c, (m: bitstring, pseudoID: bitstring, vpk: pkey,
+         ts: bitstring, ch: bitstring, sig: bitstring));
+  (* reject a stale timestamp *)
+  let stamp(=epochR, tt: bitstring) = ts in
+  (
+    (* reject a challenge that is not the RSU's own *)
+    if ch = challenge_j then
+    if mverify(sig, H4(m, pseudoID, vpk, ts, challenge_j),
+               H3(pseudoID, vpk), vpk, pkCA) = true then
+    event EndVerify(pseudoID, vpk, m, ts, challenge_j)
+  )
+  else event StaleRejected(ts, epochR).
+
+(* ========== RSU 2: second verifier, replay detection ========== *)
+let RSU2Process(pkCA: pkey) =
+  new challenge_j: bitstring;
+  out(c, challenge_j);
+  in(c_clk, epochR: bitstring);
+  in(c, (m: bitstring, pseudoID: bitstring, vpk: pkey,
+         ts: bitstring, recvCh: bitstring, sig: bitstring));
+  let stamp(=epochR, tt: bitstring) = ts in
+  (
+    if mverify(sig, H4(m, pseudoID, vpk, ts, recvCh),
+               H3(pseudoID, vpk), vpk, pkCA) = true then
+    if recvCh = challenge_j then
+      event EndVerify(pseudoID, vpk, m, ts, challenge_j)
+    else
+      event ReplayRejected(pseudoID, vpk, m, ts, recvCh, challenge_j)
+  )
+  else event StaleRejected(ts, epochR).
+
+(* ========= RSU 3: batch verification (5b) and recovery (6) ========= *)
+let BatchRSUProcess(pkCA: pkey) =
+  new challenge_j: bitstring;
+  out(c, challenge_j);
+  in(c_clk, epochR: bitstring);
+  in(c, (m1: bitstring, p1: bitstring, v1: pkey, ts1: bitstring,
+         ch1: bitstring, s1: bitstring));
+  in(c, (m2: bitstring, p2: bitstring, v2: pkey, ts2: bitstring,
+         ch2: bitstring, s2: bitstring));
+  (* Alg. 5b, step 1: drop stale, foreign-challenge and duplicate
+     messages before the batch is fixed                          *)
+  let stamp(=epochR, t1: bitstring) = ts1 in
+  let stamp(=epochR, t2: bitstring) = ts2 in
+  if ch1 = challenge_j && ch2 = challenge_j && m1 <> m2 then
+  (* Alg. 5b, aggregate check: accepted iff every message verifies *)
+  let ok1 = mverify(s1, H4(m1, p1, v1, ts1, challenge_j),
+                    H3(p1, v1), v1, pkCA) in
+  let ok2 = mverify(s2, H4(m2, p2, v2, ts2, challenge_j),
+                    H3(p2, v2), v2, pkCA) in
+    event BatchAccepted(p1, v1, m1, ts1, p2, v2, m2, ts2,
+                        challenge_j)
+  else
+  (
+    (* Alg. 6: batch failed -- split into halves of size one and
+       verify each half with Alg. 5a                             *)
+    event BatchFailed(challenge_j);
+    (
+      let r1 = mverify(s1, H4(m1, p1, v1, ts1, challenge_j),
+                       H3(p1, v1), v1, pkCA) in
+        event RecoveredValid(p1, v1, m1, ts1, challenge_j)
+      else event InvalidIsolated(challenge_j, s1)
+    )
+    |
+    (
+      let r2 = mverify(s2, H4(m2, p2, v2, ts2, challenge_j),
+                       H3(p2, v2), v2, pkCA) in
+        event RecoveredValid(p2, v2, m2, ts2, challenge_j)
+      else event InvalidIsolated(challenge_j, s2)
+    )
+  ).
+
+(* ================ Explicit relay / replay attacker ================ *)
+let AttackerProcess =
+  in(c, (m: bitstring, pseudoID: bitstring, vpk: pkey,
+         ts: bitstring, oldCh: bitstring, sig: bitstring));
+  event ReplayAttempt(pseudoID, oldCh);
+  out(c, (m, pseudoID, vpk, ts, oldCh, sig)).
+
+(* ======= Attacker registering a fabricated identity ======= *)
+let AttackerFakeRegProcess(ekTA: kpkey) =
+  new fakeRID: id;
+  new fakeSk: skey;
+  new fakeTid: bitstring;
+  new ssA: bitstring;
+  out(c, kem_enc(ssA, ekTA));
+  new nonceA: bitstring;
+  let fakeTicket =
+    (sign(H1(fakeRID, pk(fakeSk), fakeTid), fakeSk), fakeTid, ekTA) in
+  out(c, aead_enc(kdf(ssA),
+        (fakeTicket, mkPseudoID(fakeRID, nonceA), pk(fakeSk),
+         nonceA, sign(H2(fakeTid, nonceA), fakeSk)))).
+
+(* ================ Algorithm 1 (Setup) and system ================ *)
+process
+  new skCA: skey;
+  new dkTA: kskey;
+  let pkCA = pk(skCA) in
+  let ekTA = ek(dkTA) in
+  out(c, (pkCA, ekTA));                 (* Params published *)
+  ( ClockProcess
+  | CAProcess(skCA, dkTA)
+  | ! VehicleProcess(RID_Vi, pkCA, ekTA)
+  | ! RSU1Process(pkCA)
+  | ! RSU2Process(pkCA)
+  | ! BatchRSUProcess(pkCA)
+  | ! AttackerProcess
+  | ! AttackerFakeRegProcess(ekTA) )
